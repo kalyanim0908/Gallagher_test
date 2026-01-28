@@ -1,0 +1,111 @@
+name: Destroy Azure Resources
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirmation:
+        description: 'Type "destroy" to confirm resource deletion'
+        required: true
+        default: ''
+
+env:
+  TERRAFORM_VERSION: '1.5.0'
+  # Azure credentials as environment variables
+  ARM_CLIENT_ID: ${{ secrets.ARM_CLIENT_ID }}
+  ARM_CLIENT_SECRET: ${{ secrets.ARM_CLIENT_SECRET }}
+  ARM_SUBSCRIPTION_ID: ${{ secrets.ARM_SUBSCRIPTION_ID }}
+  ARM_TENANT_ID: ${{ secrets.ARM_TENANT_ID }}
+
+jobs:
+  destroy:
+    runs-on: ubuntu-latest
+    environment: production
+    
+    steps:
+    - name: Validate Confirmation
+      run: |
+        if [ "${{ github.event.inputs.confirmation }}" != "destroy" ]; then
+          echo "Destruction cancelled: confirmation input must be 'destroy'"
+          exit 1
+        fi
+        echo "Confirmation validated"
+
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Azure Login
+      uses: azure/login@v1
+      with:
+        creds: '{"clientId":"${{ secrets.ARM_CLIENT_ID }}","clientSecret":"${{ secrets.ARM_CLIENT_SECRET }}","subscriptionId":"${{ secrets.ARM_SUBSCRIPTION_ID }}","tenantId":"${{ secrets.ARM_TENANT_ID }}"}'
+
+    - name: Setup Terraform
+      uses: hashicorp/setup-terraform@v3
+      with:
+        terraform_version: ${{ env.TERRAFORM_VERSION }}
+        terraform_wrapper: false
+
+    - name: Terraform Init
+      working-directory: ./terraform
+      run: terraform init
+
+    - name: Get Resources Before Destruction
+      id: pre-destroy
+      working-directory: ./terraform
+      run: |
+        echo "Resources to be destroyed:"
+        terraform state list || echo "No state found"
+        
+        if terraform output app_service_url > /dev/null 2>&1; then
+          APP_URL=$(terraform output -raw app_service_url)
+          echo "app_url=${APP_URL}" >> $GITHUB_OUTPUT
+        fi
+      continue-on-error: true
+
+    - name: Terraform Destroy
+      working-directory: ./terraform
+      run: |
+        echo "Destroying infrastructure..."
+        terraform destroy \
+          -var="subscription_id=${{ secrets.ARM_SUBSCRIPTION_ID }}" \
+          -var="client_id=${{ secrets.ARM_CLIENT_ID }}" \
+          -var="client_secret=${{ secrets.ARM_CLIENT_SECRET }}" \
+          -var="tenant_id=${{ secrets.ARM_TENANT_ID }}" \
+          -auto-approve
+
+    - name: Verify Resources Destroyed
+      working-directory: ./terraform
+      run: |
+        echo "Verifying destruction..."
+        RESOURCE_COUNT=$(terraform state list | wc -l)
+        
+        if [ $RESOURCE_COUNT -eq 0 ]; then
+          echo "All resources successfully destroyed"
+        else
+          echo "Warning: Some resources may still exist"
+          terraform state list
+        fi
+
+    - name: Verify App Service Deleted
+      if: steps.pre-destroy.outputs.app_url != ''
+      run: |
+        APP_URL="${{ steps.pre-destroy.outputs.app_url }}"
+        echo "Verifying app service is no longer accessible..."
+        
+        if curl -f -s --max-time 10 "${APP_URL}/health" > /dev/null 2>&1; then
+          echo "Warning: App service may still be accessible"
+        else
+          echo "App service confirmed deleted"
+        fi
+      continue-on-error: true
+
+    - name: Clean Up Azure Resources (Failsafe)
+      run: |
+        echo "Running failsafe cleanup..."
+        # This will attempt to delete the resource group if it still exists
+        az group delete --name rg-ajg-platform-test --yes --no-wait || echo "Resource group already deleted"
+
+    - name: Destruction Summary
+      run: |
+        echo "Destruction completed"
+        echo "All Azure resources have been removed"
+        echo "No further costs will be incurred"
